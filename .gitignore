@@ -205,3 +205,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# --- Project Specific Ignores ---
+
+# Ignore the Evidence Vault (Spoofs/Intruders)
+evidence/
+python_edge/evidence/
+
+# Ignore local database files (so you don't overwrite each other's encodings)
+*.pkl
+python_edge/data/class_encodings.pkl
+
+
+# --- Frontend/Node.js Ignores ---
+# Ignore React/Node dependencies inside the web dashboard
+web_dashboard/node_modules/
+
+# Ignore bundled build files (Vite output)
+web_dashboard/dist/
