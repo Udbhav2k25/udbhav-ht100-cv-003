@@ -12,15 +12,13 @@ from datetime import datetime
 from collections import deque
 
 # --- CONFIGURATION ---
-CAMERA_INDEX = 0  # Use "http://IP:PORT/video" for phone
+CAMERA_INDEX = 0
 EVENT_TYPE = "ENTRY"
 
 # Thresholds
-DEPTH_THRESH = 0.05       # Z-axis difference
-EAR_THRESH = 0.22         # Eye Aspect Ratio (Blink level)
+EAR_THRESH = 0.21         # Below this = Eyes Closed (Blink)
 RECOGNITION_THRESH = 0.68 # DeepFace ArcFace match
-PITCH_THRESH = -5         # If Pitch is lower than this (Frontal/Up), fail. 
-                          # We want POSITIVE (Looking Down) for High Camera.
+BLINK_CONSEC_FRAMES = 2   # How fast a blink is (frames)
 
 # Load Secrets
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -28,8 +26,6 @@ url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
 
 # --- INITIALIZATION ---
-
-# 1. Supabase
 try:
     supabase: Client = create_client(url, key)
     print("[SYSTEM] Connected to Supabase.")
@@ -37,11 +33,9 @@ except:
     supabase = None
     print("[WARNING] Offline Mode.")
 
-# 2. Audio
 engine = pyttsx3.init()
 engine.setProperty('rate', 150)
 
-# 3. Data & Evidence
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 EVIDENCE_DIR = os.path.join(BASE_DIR, "evidence")
@@ -58,20 +52,25 @@ else:
     print("[ERROR] No database found! Run enrollment first.")
     exit()
 
-# 4. MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     min_detection_confidence=0.5, 
     min_tracking_confidence=0.5,
-    refine_landmarks=True
+    refine_landmarks=True # CRITICAL for Iris/Eye points
 )
 
-# State Variables
 last_logged = {}
 COOLDOWN = 15
-blink_buffer = deque(maxlen=10)
 
-# --- MATH FUNCTIONS ---
+# --- STATE VARIABLES FOR BLINK ---
+# We track the state across frames
+blink_counter = 0
+is_blinking = False
+liveness_verified = False
+liveness_timestamp = 0
+LIVENESS_VALIDITY_DURATION = 2.0 # How long liveness lasts after a blink (seconds)
+
+# --- HELPER FUNCTIONS ---
 
 def speak(text):
     try:
@@ -79,59 +78,47 @@ def speak(text):
         engine.runAndWait()
     except: pass
 
-def calculate_pitch(landmarks):
+def calculate_ear(landmarks, indices):
     """
-    Calculates Pitch for HIGH ANGLE CAMERA (Sentry Mode).
-    - Real person walking = Looks "Down" relative to camera (Positive Score).
-    - Phone Photo = Looks "Frontal" (Negative/Zero Score).
+    Calculates Eye Aspect Ratio (EAR).
+    EAR = (Vertical Dist A + Vertical Dist B) / (2 * Horizontal Dist C)
     """
-    nose_y = landmarks[1].y
-    chin_y = landmarks[152].y
-    top_head_y = landmarks[10].y
-    
-    face_height = abs(chin_y - top_head_y)
-    nose_dist_from_top = abs(nose_y - top_head_y)
-    
-    ratio = nose_dist_from_top / face_height
-    
-    # INVERTED LOGIC:
-    # Frontal Face Ratio ~0.5 -> Score 0
-    # Looking Down (High Angle) Ratio > 0.5 -> Score Positive
-    # Looking Up (Selfie Mode) Ratio < 0.5 -> Score Negative
-    pitch_score = (ratio - 0.5) * 100 * 2 
-    
-    return pitch_score
+    # Vertical lines
+    A = np.linalg.norm(np.array([landmarks[indices[1]].x, landmarks[indices[1]].y]) - 
+                       np.array([landmarks[indices[5]].x, landmarks[indices[5]].y]))
+    B = np.linalg.norm(np.array([landmarks[indices[2]].x, landmarks[indices[2]].y]) - 
+                       np.array([landmarks[indices[4]].x, landmarks[indices[4]].y]))
+    # Horizontal line
+    C = np.linalg.norm(np.array([landmarks[indices[0]].x, landmarks[indices[0]].y]) - 
+                       np.array([landmarks[indices[3]].x, landmarks[indices[3]].y]))
+    ear = (A + B) / (2.0 * C)
+    return ear
 
-def get_liveness_score(landmarks):
-    score = 0
-    debug_msg = ""
+def check_blink(landmarks):
+    """Returns True if a blink just finished."""
+    global blink_counter, is_blinking
 
-    # 1. PITCH CHECK (Angle)
-    pitch = calculate_pitch(landmarks)
-    
-    # If pitch is too low (Frontal/Looking Up), it's likely a phone photo.
-    if pitch < PITCH_THRESH:
-        debug_msg = f"Angle: FLAT/UP ({int(pitch)})"
-        return 0, debug_msg # Automatic Fail
-    
-    score += 40
-    debug_msg = f"Angle: OK ({int(pitch)})"
+    # Indices for Left and Right Eye (MediaPipe 468 Map)
+    # Left Eye: [33, 160, 158, 133, 153, 144]
+    # Right Eye: [362, 385, 387, 263, 373, 380]
+    left_indices = [33, 160, 158, 133, 153, 144]
+    right_indices = [362, 385, 387, 263, 373, 380]
 
-    # 2. DEPTH CHECK (Geometry)
-    nose_z = landmarks[1].z
-    avg_ear_z = (landmarks[234].z + landmarks[454].z) / 2
-    depth_diff = abs(nose_z - avg_ear_z)
-    
-    if depth_diff > DEPTH_THRESH:
-        score += 40
-        debug_msg += " | Depth: 3D"
+    ear_left = calculate_ear(landmarks, left_indices)
+    ear_right = calculate_ear(landmarks, right_indices)
+    avg_ear = (ear_left + ear_right) / 2.0
+
+    # Check threshold
+    if avg_ear < EAR_THRESH:
+        blink_counter += 1
     else:
-        debug_msg += " | Depth: FLAT"
-
-    # 3. MICRO-MOTION (Bonus)
-    score += 20
-
-    return score, debug_msg
+        # If eyes were closed for enough frames, and now open -> BLINK!
+        if blink_counter >= BLINK_CONSEC_FRAMES:
+            blink_counter = 0
+            return True, avg_ear
+        blink_counter = 0
+    
+    return False, avg_ear
 
 def save_evidence(frame, folder_name):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -155,6 +142,7 @@ def save_evidence(frame, folder_name):
 # --- MAIN LOOP ---
 
 def start_sentry():
+    global liveness_verified, liveness_timestamp
     cap = cv2.VideoCapture(CAMERA_INDEX)
     print(f"[SENTRY] Active. Monitoring {EVENT_TYPE}...")
 
@@ -165,37 +153,29 @@ def start_sentry():
         display_frame = frame.copy()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        status_text = "Scanning..."
-        status_color = (255, 255, 255)
-        liveness_score = 0
-        debug_info = ""
+        status_text = "WAITING FOR FACE..."
+        status_color = (200, 200, 200)
+        ear_val = 0.0
 
         results = face_mesh.process(rgb_frame)
         
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
                 
-                liveness_score, debug_info = get_liveness_score(face_landmarks.landmark)
-
-                if liveness_score < 60:
-                    status_text = "SPOOF DETECTED"
-                    status_color = (0, 0, 255) # Red
-                    
-                    now = time.time()
-                    if "spoof" not in last_logged or (now - last_logged.get("spoof", 0) > COOLDOWN):
-                        print("[ALERT] Spoof Attempt!")
-                        evidence_url = save_evidence(frame, "spoofs")
-                        if supabase:
-                            supabase.table("attendance_logs").insert({
-                                "event_type": EVENT_TYPE, "camera_id": CAMERA_INDEX,
-                                "is_spoof": True, "evidence_url": evidence_url
-                            }).execute()
-                        last_logged["spoof"] = now
+                # 1. CHECK BLINK (Primary Liveness)
+                has_blinked, ear_val = check_blink(face_landmarks.landmark)
                 
-                else:
-                    # RECOGNITION
-                    status_text = "Verifying..."
-                    status_color = (255, 0, 0)
+                if has_blinked:
+                    liveness_verified = True
+                    liveness_timestamp = time.time()
+                    print("[LIVENESS] Blink Detected! Unlock.")
+
+                # Check if liveness is still valid (expires after 2 seconds)
+                if liveness_verified and (time.time() - liveness_timestamp < LIVENESS_VALIDITY_DURATION):
+                    
+                    # --- LIVENESS PASSED: RECOGNIZE ---
+                    status_text = "Verifying Identity..."
+                    status_color = (255, 0, 0) # Blue
 
                     try:
                         current_objs = DeepFace.represent(
@@ -221,7 +201,7 @@ def start_sentry():
 
                             if best_score < RECOGNITION_THRESH:
                                 status_text = f"{EVENT_TYPE}: {best_name}"
-                                status_color = (0, 255, 0)
+                                status_color = (0, 255, 0) # Green
                                 
                                 now = time.time()
                                 if best_roll not in last_logged or (now - last_logged.get(best_roll, 0) > COOLDOWN):
@@ -235,23 +215,28 @@ def start_sentry():
                                     last_logged[best_roll] = now
                             else:
                                 status_text = "Unknown Person"
-                                status_color = (0, 165, 255)
-                                
-                                now = time.time()
-                                if "intruder" not in last_logged or (now - last_logged.get("intruder", 0) > COOLDOWN):
-                                    print("[ALERT] Intruder Detected!")
-                                    evidence_url = save_evidence(frame, "intruders")
-                                    if supabase:
-                                        supabase.table("attendance_logs").insert({
-                                            "roll_no": None, "event_type": EVENT_TYPE,
-                                            "camera_id": CAMERA_INDEX, "is_spoof": False, "evidence_url": evidence_url
-                                        }).execute()
-                                    last_logged["intruder"] = now
+                                status_color = (0, 165, 255) # Orange
+                                # Intruder Logic (Optional: log evidence)
 
                     except: pass
 
+                else:
+                    # --- LIVENESS FAILED / EXPIRED ---
+                    status_text = "PLEASE BLINK EYES"
+                    status_color = (0, 255, 255) # Yellow
+                    liveness_verified = False # Reset
+
+                    # If EAR is consistently high (staring) for too long, it's suspicious
+                    # But for now, we just wait for a blink.
+                    # A photo will stay in this state forever.
+
+        # UI
         cv2.putText(display_frame, status_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-        cv2.putText(display_frame, f"{debug_info}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        
+        # Debug EAR (Helpful to see if blink is registering)
+        # Normal Eye ~0.30, Blink < 0.20
+        debug_str = f"Eye Ratio: {ear_val:.3f} (Blink if < {EAR_THRESH})"
+        cv2.putText(display_frame, debug_str, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         cv2.imshow("Sentry Mode", display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
